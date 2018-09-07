@@ -174,6 +174,15 @@ type ListOptions struct {
 	PageSize int `url:"page[size],omitempty"`
 }
 
+// Pagination is used to return the pagination details of an API request.
+type Pagination struct {
+	CurrentPage  int `json:"current-page"`
+	PreviousPage int `json:"prev-page"`
+	NextPage     int `json:"next-page"`
+	TotalPages   int `json:"total-pages"`
+	TotalCount   int `json:"total-count"`
+}
+
 // newRequest creates an API request. A relative URL path can be provided in
 // path, in which case it is resolved relative to the apiVersionPath of the
 // Client. Relative URL paths should always be specified without a preceding
@@ -245,11 +254,13 @@ func (c *Client) newRequest(method, path string, v interface{}) (*http.Request, 
 	return req, nil
 }
 
-// do sends an API request and returns the API response. The API response is
-// JSONAPI decoded and stored in the value pointed to by v, or returned as an
-// error if an API error has occurred.
+// do sends an API request and returns the API response. The API response
+// is JSONAPI decoded and the document's primary data is stored in the value
+// pointed to by v, or returned as an error if an API error has occurred.
+
 // If v implements the io.Writer interface, the raw response body will be
 // written to v, without attempting to first decode it.
+//
 // The provided ctx must be non-nil. If it is canceled or times out, ctx.Err()
 // will be returned.
 func (c *Client) do(ctx context.Context, req *http.Request, v interface{}) error {
@@ -286,22 +297,47 @@ func (c *Client) do(ctx context.Context, req *http.Request, v interface{}) error
 		return err
 	}
 
-	// Get the value of v so we can test if it's a slice.
+	// Get the value of v so we can test if it's a struct.
 	dst := reflect.Indirect(reflect.ValueOf(v))
 
-	// Unmarshal a single value if v isn't a slice.
-	if dst.Type().Kind() != reflect.Slice {
+	// Return an error if v is not a struct or an io.Writer.
+	if dst.Kind() != reflect.Struct {
+		return fmt.Errorf("v must be a struct or an io.Writer")
+	}
+
+	// Try to get the Pagination and Items struct fields.
+	pagination := dst.FieldByName("Pagination")
+	items := dst.FieldByName("Items")
+
+	// Unmarshal a single value if v does not contain the
+	// Pagination and Items struct fields.
+	if !items.IsValid() || !pagination.IsValid() {
 		return jsonapi.UnmarshalPayload(resp.Body, v)
 	}
 
-	// Unmarshal as a list of values if v is a slice.
-	raw, err := jsonapi.UnmarshalManyPayload(resp.Body, dst.Type().Elem())
+	// Return an error if v.Items is not a slice.
+	if items.Type().Kind() != reflect.Slice {
+		return fmt.Errorf("v.Items must be a slice")
+	}
+
+	// As we are getting a list of values, we need to decode
+	// the pagination details out of the response body.
+	p, err := parsePagination(resp)
+	if err != nil {
+		return err
+	}
+
+	// Pointer-swap the decoded pagination details.
+	pagination.Set(reflect.ValueOf(p))
+
+	// Unmarshal as a list of values as v.Items is a slice.
+	raw, err := jsonapi.UnmarshalManyPayload(resp.Body, items.Type().Elem())
 	if err != nil {
 		return err
 	}
 
 	// Make a new slice to hold the results.
-	sliceType := reflect.SliceOf(dst.Type().Elem())
+	sliceType := reflect.SliceOf(items.Type().Elem())
 	result := reflect.MakeSlice(sliceType, 0, len(raw))
 
 	// Add all of the results to the new slice.
@@ -310,9 +346,32 @@ func (c *Client) do(ctx context.Context, req *http.Request, v interface{}) error
 	}
 
 	// Pointer-swap the result.
-	dst.Set(result)
+	items.Set(result)
 
 	return nil
+}
+
+func parsePagination(resp *http.Response) (*Pagination, error) {
+	var raw struct {
+		Meta struct {
+			Pagination Pagination `json:"pagination"`
+		} `json:"meta"`
+	}
+
+	// Create a temporary buffer and copy all the read data into it.
+	b := bytes.NewBuffer(nil)
+	reader := io.TeeReader(resp.Body, b)
+
+	// JSON decode the raw response.
+	if err := json.NewDecoder(reader).Decode(&raw); err != nil {
+		return &Pagination{}, err
+	}
+
+	// Close the original resp.Body and set it to the buffered data.
+	resp.Body.Close()
+	resp.Body = ioutil.NopCloser(b)
+
+	return &raw.Meta.Pagination, nil
 }
 
 // checkResponseCode can be used to check the status code of an HTTP request.
